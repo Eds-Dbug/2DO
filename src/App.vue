@@ -14,6 +14,7 @@ const selectedDate = ref(null)
 const currentDate = ref(new Date())
 const loading = ref(false)
 const saving = ref(false) // New: show saving state
+const submitting = ref(false) // Prevent double submit / UI lock
 const showCalendarSelection = ref(true) // New: show calendar selection first
 const calendarsPath = ref('')
 const calendarUpdateKey = ref(0) // Force calendar re-render
@@ -107,9 +108,11 @@ const sortTodosByOrder = (todos, sortOrder) => {
     if (a.dueDate && b.dueDate) {
       const dateA = toDate(a.dueDate)
       const dateB = toDate(b.dueDate)
-      const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
-      if (dateDiff !== 0) {
-        return dateDiff
+      if (dateA && dateB) {
+        const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
+        if (!Number.isNaN(dateDiff) && dateDiff !== 0) {
+          return dateDiff
+        }
       }
     } else if (a.dueDate && !b.dueDate) {
       return sortOrder === 'asc' ? -1 : 1 // Tasks with due dates come first in desc, last in asc
@@ -121,9 +124,11 @@ const sortTodosByOrder = (todos, sortOrder) => {
     if (a.createdAt && b.createdAt) {
       const dateA = toDate(a.createdAt)
       const dateB = toDate(b.createdAt)
-      const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
-      if (dateDiff !== 0) {
-        return dateDiff
+      if (dateA && dateB) {
+        const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
+        if (!Number.isNaN(dateDiff) && dateDiff !== 0) {
+          return dateDiff
+        }
       }
     } else if (a.createdAt && !b.createdAt) {
       return sortOrder === 'asc' ? -1 : 1
@@ -147,8 +152,8 @@ const sortTodosByOrder = (todos, sortOrder) => {
     }
     
     // Quinary sort: by ID (for consistent ordering)
-    const idDiff = a.id - b.id
-    return sortOrder === 'asc' ? idDiff : -idDiff
+    const idCompare = String(a.id).localeCompare(String(b.id))
+    return sortOrder === 'asc' ? idCompare : -idCompare
   })
 }
 
@@ -283,10 +288,17 @@ const saveTodosToFile = async () => {
     alert('Failed to save changes. Please try again.')
   } finally {
     saving.value = false
+    // Force calendar recompute and sidebar refresh if open
+    calendarUpdateKey.value++
+    if (selectedDate.value) {
+      sidebarTasks.value = getTasksForDate(selectedDate.value)
+    }
   }
 }
 
 const createTask = async () => {
+  if (submitting.value) return
+  submitting.value = true
   console.log('createTask called, isEditingTask:', isEditingTask.value)
   console.log('Form data:', newTask.value)
   
@@ -333,17 +345,23 @@ const createTask = async () => {
     todos.value.push(task)
   }
   
-  closeTaskForm()
-  
-  // Save changes to file
-  await saveTodosToFile()
+  // Save changes to file and ensure modal is closed regardless of outcome
+  try {
+    // Close immediately for responsiveness
+    closeTaskForm()
+    await nextTick()
+    await saveTodosToFile()
+  } finally {
+    // Ensure state is reset even if an error occurred
+    if (showTaskForm.value) closeTaskForm()
+    submitting.value = false
+  }
 }
 
 const closeTaskForm = () => {
   showTaskForm.value = false
   isEditingTask.value = false
   editingTaskId.value = null
-  selectedDate.value = null
   newTask.value = {
     title: '',
     description: '',
@@ -376,10 +394,9 @@ const getTasksForDate = (date) => {
   return todos.value.filter(todo => {
     if (!todo.dueDate) return false
     
-    // Parse date string in local time to avoid timezone issues
-    const todoDate = typeof todo.dueDate === 'string' 
-      ? new Date(todo.dueDate + 'T00:00:00') // Force local time interpretation
-      : todo.dueDate
+    // Parse using unified helper
+    const todoDate = toDate(todo.dueDate)
+    if (!todoDate) return false
     
     const isOnDate = todoDate.toDateString() === date.toDateString()
     
@@ -403,6 +420,7 @@ const getPriorityColor = (priority) => {
 
 const formatDate = (date) => {
   const dateObj = toDate(date)
+  if (!dateObj || isNaN(dateObj.getTime())) return ''
   return dateObj.toLocaleDateString('en-US', { 
     month: 'short', 
     day: 'numeric',
@@ -414,6 +432,7 @@ const formatDate = (date) => {
 const formatDateForInput = (date) => {
   if (!date) return ''
   const dateObj = toDate(date)
+  if (!dateObj || isNaN(dateObj.getTime())) return ''
   const year = dateObj.getFullYear()
   const month = String(dateObj.getMonth() + 1).padStart(2, '0')
   const day = String(dateObj.getDate()).padStart(2, '0')
@@ -434,10 +453,13 @@ const toDate = (value) => {
   if (value instanceof Date) return value
   if (typeof value === 'string') {
     const trimmed = value.trim()
+    if (!trimmed) return null
     const hasT = trimmed.includes('T')
-    return new Date(hasT ? trimmed : `${trimmed}T00:00:00`)
+    const d = new Date(hasT ? trimmed : `${trimmed}T00:00:00`)
+    return isNaN(d.getTime()) ? null : d
   }
-  return new Date(value)
+  const d = new Date(value)
+  return isNaN(d.getTime()) ? null : d
 }
 
 const formatLastModified = (timestamp) => {
@@ -473,7 +495,9 @@ const closeSidebar = () => {
 }
 
 const formatDateForSidebar = (date) => {
-  return date.toLocaleDateString('en-US', { 
+  const d = toDate(date)
+  if (!d) return ''
+  return d.toLocaleDateString('en-US', { 
     weekday: 'long', 
     year: 'numeric', 
     month: 'long', 
@@ -1088,7 +1112,7 @@ const formatDateForSidebar = (date) => {
             </button>
           </div>
 
-          <form @submit.prevent="createTask" @submit="console.log('Form submitted')" class="space-y-4">
+          <form @submit.prevent="createTask" class="space-y-4">
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Title</label>
               <input 
@@ -1156,8 +1180,13 @@ const formatDateForSidebar = (date) => {
               </button>
               <button 
                 type="submit"
-                @click="console.log('Update button clicked')"
-                class="flex-1 px-4 py-2 bg-emerald-500 text-white rounded-md hover:bg-emerald-600 transition-colors"
+                :disabled="submitting || saving"
+                :class="[
+                  'flex-1 px-4 py-2 rounded-md transition-colors',
+                  (submitting || saving)
+                    ? 'bg-emerald-300 text-white cursor-not-allowed'
+                    : 'bg-emerald-500 text-white hover:bg-emerald-600'
+                ]"
               >
                 {{ isEditingTask ? 'Update Task' : 'Create Task' }}
               </button>
