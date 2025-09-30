@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use chrono::{NaiveDate, Utc, Datelike, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, Utc, Datelike, Timelike};
 use std::path::PathBuf;
 use std::fs;
 
@@ -444,18 +444,25 @@ async fn save_todos_to_calendar(calendar_path: String, todos: Vec<Todo>) -> Resu
         // Due date
         if let Some(due_date) = &todo.due_date {
             if let Ok(date) = NaiveDate::parse_from_str(due_date, "%Y-%m-%d") {
-                calendar_content.push_str(&format!("DUE:{}\r\n", date.format("%Y%m%d")));
+                calendar_content.push_str(&format!(
+                    "DUE:{:04}{:02}{:02}\r\n",
+                    date.year(), date.month(), date.day()
+                ));
             }
         }
         
         // Created date
         if let Some(created_at) = &todo.created_at {
             if let Ok(date) = NaiveDate::parse_from_str(created_at, "%Y-%m-%d") {
-                calendar_content.push_str(&format!("CREATED:{}\r\n", date.format("%Y%m%d")));
-            } else if let Ok(dt) = NaiveDate::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S") {
-                calendar_content.push_str(&format!("CREATED:{}T{}Z\r\n", 
-                    dt.format("%Y%m%d"), 
-                    dt.format("%H%M%S")));
+                calendar_content.push_str(&format!(
+                    "CREATED:{:04}{:02}{:02}\r\n",
+                    date.year(), date.month(), date.day()
+                ));
+            } else if let Ok(dt) = NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S") {
+                calendar_content.push_str(&format!(
+                    "CREATED:{:04}{:02}{:02}T{:02}{:02}{:02}Z\r\n",
+                    dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second()
+                ));
             }
         }
         
