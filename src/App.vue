@@ -105,8 +105,8 @@ const sortTodosByOrder = (todos, sortOrder) => {
   return [...todos].sort((a, b) => {
     // Primary sort: by due date (respecting sort order)
     if (a.dueDate && b.dueDate) {
-      const dateA = new Date(a.dueDate)
-      const dateB = new Date(b.dueDate)
+      const dateA = toDate(a.dueDate)
+      const dateB = toDate(b.dueDate)
       const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
       if (dateDiff !== 0) {
         return dateDiff
@@ -119,8 +119,8 @@ const sortTodosByOrder = (todos, sortOrder) => {
     
     // Secondary sort: by creation date (if available)
     if (a.createdAt && b.createdAt) {
-      const dateA = new Date(a.createdAt)
-      const dateB = new Date(b.createdAt)
+      const dateA = toDate(a.createdAt)
+      const dateB = toDate(b.createdAt)
       const dateDiff = sortOrder === 'asc' ? dateA - dateB : dateB - dateA
       if (dateDiff !== 0) {
         return dateDiff
@@ -402,9 +402,7 @@ const getPriorityColor = (priority) => {
 }
 
 const formatDate = (date) => {
-  const dateObj = typeof date === 'string' 
-    ? new Date(date + 'T00:00:00') // Force local time interpretation
-    : date
+  const dateObj = toDate(date)
   return dateObj.toLocaleDateString('en-US', { 
     month: 'short', 
     day: 'numeric',
@@ -415,9 +413,7 @@ const formatDate = (date) => {
 // Helper function to format date for input field (YYYY-MM-DD)
 const formatDateForInput = (date) => {
   if (!date) return ''
-  const dateObj = typeof date === 'string' 
-    ? new Date(date + 'T00:00:00') // Force local time interpretation
-    : date
+  const dateObj = toDate(date)
   const year = dateObj.getFullYear()
   const month = String(dateObj.getMonth() + 1).padStart(2, '0')
   const day = String(dateObj.getDate()).padStart(2, '0')
@@ -429,6 +425,19 @@ const createLocalDate = (dateString) => {
   if (!dateString) return null
   const [year, month, day] = dateString.split('-').map(Number)
   return new Date(year, month - 1, day) // month is 0-indexed
+}
+
+// Parse dates flexibly from either a Date, a date-only string (YYYY-MM-DD),
+// or an ISO datetime string (YYYY-MM-DDTHH:MM:SS[.sss][Z])
+const toDate = (value) => {
+  if (!value) return null
+  if (value instanceof Date) return value
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    const hasT = trimmed.includes('T')
+    return new Date(hasT ? trimmed : `${trimmed}T00:00:00`)
+  }
+  return new Date(value)
 }
 
 const formatLastModified = (timestamp) => {
@@ -694,7 +703,7 @@ const formatDateForSidebar = (date) => {
                   {{ todo.title }}
                 </h3>
                 <p v-if="todo.description" :class="[
-                  'text-sm text-slate-600 mt-1',
+                  'text-sm text-slate-600 mt-1 whitespace-pre-line',
                   todo.completed && 'line-through text-slate-400'
                 ]">
                   {{ todo.description }}
@@ -788,7 +797,7 @@ const formatDateForSidebar = (date) => {
                     {{ todo.title }}
                   </h3>
                   <p v-if="todo.description" :class="[
-                    'text-sm text-slate-600 mt-1',
+                    'text-sm text-slate-600 mt-1 whitespace-pre-line',
                     todo.completed && 'line-through text-slate-400'
                   ]">
                     {{ todo.description }}
@@ -992,7 +1001,7 @@ const formatDateForSidebar = (date) => {
                     </span>
                   </div>
                   
-                  <p v-if="todo.description" class="text-sm text-slate-600 mb-2">
+                  <p v-if="todo.description" class="text-sm text-slate-600 mb-2 whitespace-pre-line">
                     {{ todo.description }}
                   </p>
                   
