@@ -272,8 +272,8 @@ fn parse_vtodo_from_lines(lines: &[&str], calendar_name: &str) -> Result<Todo, S
             
             match base_property {
                 "UID" => id = property_value.to_string(),
-                "SUMMARY" => title = property_value.to_string(),
-                "DESCRIPTION" => description = property_value.to_string(),
+                "SUMMARY" => title = unescape_ical_text(property_value),
+                "DESCRIPTION" => description = unescape_ical_text(property_value),
                 "STATUS" => {
                     completed = property_value == "COMPLETED";
                 },
@@ -286,7 +286,7 @@ fn parse_vtodo_from_lines(lines: &[&str], calendar_name: &str) -> Result<Todo, S
                     }.to_string();
                 },
                 "CATEGORIES" => {
-                    category = Some(property_value.to_string());
+                    category = Some(unescape_ical_text(property_value));
                 },
                 "DUE" => {
                     // Parse iCalendar date format (YYYYMMDD or YYYYMMDDTHHMMSSZ)
@@ -304,10 +304,12 @@ fn parse_vtodo_from_lines(lines: &[&str], calendar_name: &str) -> Result<Todo, S
                     }
                 },
                 "CREATED" | "DTSTAMP" => {
+                    eprintln!("Parsing {} field: '{}' (len: {})", base_property, property_value, property_value.len());
                     // Parse iCalendar datetime format (YYYYMMDDTHHMMSSZ)
                     if property_value.len() >= 15 && property_value.contains('T') {
                         let date_part = &property_value[0..8];
                         let time_part = &property_value[9..15];
+                        eprintln!("  Date part: '{}', Time part: '{}'", date_part, time_part);
                         
                         if let Ok(year) = date_part[0..4].parse::<i32>() {
                             if let Ok(month) = date_part[4..6].parse::<u32>() {
@@ -317,25 +319,54 @@ fn parse_vtodo_from_lines(lines: &[&str], calendar_name: &str) -> Result<Todo, S
                                             if let Ok(second) = time_part[4..6].parse::<u32>() {
                                                 if let Some(dt) = NaiveDate::from_ymd_opt(year, month, day)
                                                     .and_then(|d| d.and_hms_opt(hour, minute, second)) {
-                                                    created_at = Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string());
+                                                    let formatted = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                                                    eprintln!("  Successfully parsed {} to: '{}'", base_property, formatted);
+                                                    created_at = Some(formatted);
+                                                } else {
+                                                    eprintln!("  Failed to create datetime from {}-{}-{} {}:{}:{}", year, month, day, hour, minute, second);
                                                 }
+                                            } else {
+                                                eprintln!("  Failed to parse second: '{}'", &time_part[4..6]);
                                             }
+                                        } else {
+                                            eprintln!("  Failed to parse minute: '{}'", &time_part[2..4]);
                                         }
+                                    } else {
+                                        eprintln!("  Failed to parse hour: '{}'", &time_part[0..2]);
                                     }
+                                } else {
+                                    eprintln!("  Failed to parse day: '{}'", &date_part[6..8]);
                                 }
+                            } else {
+                                eprintln!("  Failed to parse month: '{}'", &date_part[4..6]);
                             }
+                        } else {
+                            eprintln!("  Failed to parse year: '{}'", &date_part[0..4]);
                         }
                     } else if property_value.len() == 8 {
+                        eprintln!("  Parsing as date-only format");
                         // Handle date-only format (YYYYMMDD)
                         if let Ok(year) = property_value[0..4].parse::<i32>() {
                             if let Ok(month) = property_value[4..6].parse::<u32>() {
                                 if let Ok(day) = property_value[6..8].parse::<u32>() {
                                     if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
-                                        created_at = Some(date.format("%Y-%m-%d").to_string());
+                                        let formatted = date.format("%Y-%m-%d").to_string();
+                                        eprintln!("  Successfully parsed {} to: '{}'", base_property, formatted);
+                                        created_at = Some(formatted);
+                                    } else {
+                                        eprintln!("  Failed to create date from {}-{}-{}", year, month, day);
                                     }
+                                } else {
+                                    eprintln!("  Failed to parse day: '{}'", &property_value[6..8]);
                                 }
+                            } else {
+                                eprintln!("  Failed to parse month: '{}'", &property_value[4..6]);
                             }
+                        } else {
+                            eprintln!("  Failed to parse year: '{}'", &property_value[0..4]);
                         }
+                    } else {
+                        eprintln!("  Field length {} is not 8 or >=15, skipping", property_value.len());
                     }
                 },
                 _ => {} // Ignore other properties
@@ -422,7 +453,9 @@ async fn save_todos_to_calendar(calendar_path: String, todos: Vec<Todo>) -> Resu
             if let Ok(date) = NaiveDate::parse_from_str(created_at, "%Y-%m-%d") {
                 calendar_content.push_str(&format!("CREATED:{}\r\n", date.format("%Y%m%d")));
             } else if let Ok(dt) = NaiveDate::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S") {
-                calendar_content.push_str(&format!("CREATED:{}\r\n", dt.format("%Y%m%d")));
+                calendar_content.push_str(&format!("CREATED:{}T{}Z\r\n", 
+                    dt.format("%Y%m%d"), 
+                    dt.format("%H%M%S")));
             }
         }
         
@@ -459,6 +492,25 @@ fn escape_ical_text(text: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect()
+}
+
+// Helper to unescape iCalendar text per RFC 5545
+// - \n or \N => newline
+// - \; => ;, \, => ,
+// - \\ => \
+fn unescape_ical_text(text: &str) -> String {
+    // First, reduce doubled backslashes to single to normalize over-escaped inputs
+    let mut s = text.to_string();
+    loop {
+        let collapsed = s.replace("\\\\", "\\");
+        if collapsed == s { break; }
+        s = collapsed;
+    }
+    s = s.replace("\\n", "\n");
+    s = s.replace("\\N", "\n");
+    s = s.replace("\\;", ";");
+    s = s.replace("\\,", ",");
+    s
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
