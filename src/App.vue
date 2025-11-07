@@ -1,9 +1,11 @@
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 
 // Reactive state
 const calendars = ref([])
+const externalCalendars = ref([]) // Calendars from external folders
 const todos = ref([])
 const selectedCalendar = ref(null)
 const currentView = ref('list')
@@ -23,6 +25,7 @@ const showCompletedInList = ref(true) // Show completed tasks in list view
 const searchQuery = ref('') // Search filter for tasks
 const incompleteSortOrder = ref('desc') // Sort order for incomplete tasks: 'asc' or 'desc'
 const completedSortOrder = ref('desc') // Sort order for completed tasks: 'asc' or 'desc'
+// Removed: isDatePickerActive and dateInputRef - no longer needed with custom picker
 
 // Calendar sidebar state
 const sidebarTasks = ref([]) // Tasks for the selected date
@@ -46,6 +49,7 @@ const multiDateError = ref('')
 // In-modal multi-date picker state
 const showDueDatePicker = ref(false)
 const duePickerCurrent = ref(new Date())
+const isSingleDateMode = ref(false) // Track if picker is in single-date mode
 const duePickerMonthYear = computed(() => {
   return duePickerCurrent.value.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
 })
@@ -67,10 +71,34 @@ const duePickerDays = computed(() => {
 const togglePickerDate = (d) => {
   const ymd = formatDateForInput(d)
   if (!ymd) return
+  
   if (multiDates.value.includes(ymd)) {
-    multiDates.value = multiDates.value.filter(x => x !== ymd)
+    // If in single-date mode, don't allow deselecting (just select a different date)
+    if (isSingleDateMode.value) {
+      // In single-date mode, always replace with new selection
+      multiDates.value = [ymd]
+      newTask.value.dueDate = ymd
+      // Auto-close after a brief delay for better UX
+      setTimeout(() => {
+        showDueDatePicker.value = false
+      }, 300)
+    } else {
+      // In multi-date mode, allow deselecting
+      multiDates.value = multiDates.value.filter(x => x !== ymd)
+    }
   } else {
-    multiDates.value = Array.from(new Set([...multiDates.value, ymd]))
+    if (isSingleDateMode.value) {
+      // In single-date mode, replace the selection and auto-apply
+      multiDates.value = [ymd]
+      newTask.value.dueDate = ymd
+      // Auto-close after a brief delay for better UX
+      setTimeout(() => {
+        showDueDatePicker.value = false
+      }, 300)
+    } else {
+      // In multi-date mode, add to selection
+      multiDates.value = Array.from(new Set([...multiDates.value, ymd]))
+    }
   }
 }
 
@@ -79,16 +107,29 @@ const isPickerSelected = (d) => {
   return !!ymd && multiDates.value.includes(ymd)
 }
 
-const openDueDatePicker = () => {
+const openDueDatePicker = (forSingleDate = false) => {
   multiDateError.value = ''
+  isSingleDateMode.value = forSingleDate
   showDueDatePicker.value = true
-  // Initialize picker month around the first selected date or today
-  const base = multiDates.value[0] ? createLocalDate(multiDates.value[0]) : new Date()
+  
+  // If opening for single date selection, clear multi-dates and use the current dueDate
+  if (forSingleDate) {
+    multiDates.value = []
+    if (newTask.value.dueDate) {
+      multiDates.value = [newTask.value.dueDate]
+    }
+  }
+  
+  // Initialize picker month around the first selected date, current dueDate, or today
+  const base = multiDates.value[0] 
+    ? createLocalDate(multiDates.value[0]) 
+    : (newTask.value.dueDate ? createLocalDate(newTask.value.dueDate) : new Date())
   duePickerCurrent.value = base || new Date()
 }
 
 const closeDueDatePicker = () => {
   showDueDatePicker.value = false
+  isSingleDateMode.value = false
 }
 
 const prevDuePickerMonth = () => {
@@ -102,11 +143,28 @@ const nextDuePickerMonth = () => {
 }
 
 const applyDuePickerSelection = () => {
-  // If exactly one date selected, mirror it into the single-date field for convenience
-  if (multiDates.value.length === 1) {
-    newTask.value.dueDate = multiDates.value[0]
+  // If dates are selected, update the dueDate field
+  if (multiDates.value.length > 0) {
+    // If single date, set it directly
+    if (multiDates.value.length === 1) {
+      newTask.value.dueDate = multiDates.value[0]
+    }
+    // If multiple dates, use the first one for the main dueDate field
+    // (multi-dates are handled separately for task creation)
   }
   showDueDatePicker.value = false
+}
+
+// Format date for display in the text input (readable format)
+const formatDateForDisplay = (dateString) => {
+  if (!dateString) return ''
+  const date = createLocalDate(dateString)
+  if (!date) return ''
+  return date.toLocaleDateString('en-US', { 
+    month: 'short', 
+    day: 'numeric', 
+    year: 'numeric' 
+  })
 }
 
 // New calendar modal state
@@ -119,11 +177,45 @@ const newCalendarError = ref('')
 onMounted(async () => {
   await loadCalendars()
   await loadCalendarsPath()
+  await loadExternalCalendarsFromStorage()
+  
+  // Add escape key handler to close date picker and modal
+  document.addEventListener('keydown', handleEscapeKey)
 })
 
-// Watch for changes in todos
+// Cleanup on unmount
+onUnmounted(() => {
+  document.removeEventListener('keydown', handleEscapeKey)
+})
+
+// Handle escape key to close date picker and modal
+const handleEscapeKey = (event) => {
+  if (event.key === 'Escape' || event.keyCode === 27) {
+    // Close custom date picker if open
+    if (showDueDatePicker.value) {
+      event.preventDefault()
+      event.stopPropagation()
+      closeDueDatePicker()
+      return
+    }
+    // Otherwise just close the form
+    if (showTaskForm.value) {
+      closeTaskForm()
+    }
+  }
+}
+
+// Watch for changes in todos - debounced to prevent UI blocking
+let calendarUpdateTimer = null
 watch(todos, () => {
-  calendarUpdateKey.value++ // Force calendar re-render
+  // Clear any pending update
+  if (calendarUpdateTimer) {
+    clearTimeout(calendarUpdateTimer)
+  }
+  // Debounce calendar updates to prevent blocking during rapid changes
+  calendarUpdateTimer = setTimeout(() => {
+    calendarUpdateKey.value++ // Force calendar re-render
+  }, 100)
 }, { deep: true })
 
 // Watch for changes in showCompletedInCalendar
@@ -132,7 +224,7 @@ watch(showCompletedInCalendar, () => {
 })
 
 
-// Load all available calendars
+// Load all available calendars (from calendars folder)
 const loadCalendars = async () => {
   try {
     loading.value = true
@@ -141,6 +233,105 @@ const loadCalendars = async () => {
     console.error('Failed to load calendars:', error)
   } finally {
     loading.value = false
+  }
+}
+
+// Load external calendars from localStorage
+const loadExternalCalendarsFromStorage = async () => {
+  try {
+    const stored = localStorage.getItem('externalCalendars')
+    if (stored) {
+      const calendars = JSON.parse(stored)
+      // Validate that files still exist
+      const validCalendars = []
+      for (const cal of calendars) {
+        try {
+          // Try to get the calendar info to verify it still exists
+          await invoke('add_external_calendar', { calendarPath: cal.path })
+          validCalendars.push(cal)
+        } catch (error) {
+          console.warn(`External calendar file no longer exists: ${cal.path}`, error)
+          // File doesn't exist or is invalid, skip it
+        }
+      }
+      externalCalendars.value = validCalendars
+      // Update storage to remove invalid entries
+      if (validCalendars.length !== calendars.length) {
+        saveExternalCalendarsToStorage()
+      }
+    }
+  } catch (error) {
+    console.error('Failed to load external calendars from storage:', error)
+  }
+}
+
+// Save external calendars to localStorage
+const saveExternalCalendarsToStorage = () => {
+  try {
+    localStorage.setItem('externalCalendars', JSON.stringify(externalCalendars.value))
+  } catch (error) {
+    console.error('Failed to save external calendars to storage:', error)
+  }
+}
+
+// Remove an external calendar
+const removeExternalCalendar = (calendarPath) => {
+  externalCalendars.value = externalCalendars.value.filter(cal => cal.path !== calendarPath)
+  saveExternalCalendarsToStorage()
+}
+
+// Get all calendars (from calendars folder + external)
+const allCalendars = computed(() => {
+  return [...calendars.value, ...externalCalendars.value]
+})
+
+// Browse for .ics file from external folder
+const browseForCalendarFile = async () => {
+  try {
+    const selected = await open({
+      multiple: true,
+      filters: [{
+        name: 'iCalendar Files',
+        extensions: ['ics']
+      }]
+    })
+    
+    if (selected) {
+      // Handle both single file and array of files
+      // In Tauri 2.0, the result can be a string (single file) or array of strings
+      const filePaths = Array.isArray(selected) ? selected : [selected]
+      
+      for (const filePath of filePaths) {
+        // Extract path - could be a string or object with path property
+        const path = typeof filePath === 'string' ? filePath : (filePath?.path || filePath)
+        
+        if (!path) {
+          continue
+        }
+        
+        // Check if this calendar is already added
+        const isDuplicate = externalCalendars.value.some(cal => cal.path === path)
+        if (isDuplicate) {
+          continue
+        }
+        
+        try {
+          const calendar = await invoke('add_external_calendar', { calendarPath: path })
+          externalCalendars.value.push(calendar)
+        } catch (error) {
+          console.error('Failed to add external calendar:', error)
+          alert(`Failed to add calendar file: ${error}`)
+        }
+      }
+      
+      saveExternalCalendarsToStorage()
+    }
+  } catch (error) {
+    console.error('Failed to open file dialog:', error)
+    // User might have cancelled, which is fine
+    if (error && !error.toString().includes('User cancelled')) {
+      alert(`Failed to open file dialog: ${error}`)
+    }
   }
 }
 
@@ -358,15 +549,15 @@ const toggleTodo = async (id) => {
   const todo = todos.value.find(t => t.id === id)
   if (todo) {
     todo.completed = !todo.completed
-    // Save changes to file
+    // Save changes to file (debounced)
     await saveTodosToFile()
   }
 }
 
 const deleteTodo = async (id) => {
   todos.value = todos.value.filter(t => t.id !== id)
-  // Save changes to file
-  await saveTodosToFile()
+  // Save changes to file (immediate for deletions)
+  await saveTodosToFile(true)
 }
 
 const editTodo = (id) => {
@@ -391,43 +582,72 @@ const editTodo = (id) => {
   }
 }
 
+// Debounce timer for save operations
+let saveDebounceTimer = null
+
 // Save todos back to the calendar file
-const saveTodosToFile = async () => {
+const saveTodosToFile = async (immediate = false) => {
   if (!selectedCalendar.value) {
     console.error('No calendar selected, cannot save')
     return
   }
   
-  try {
-    saving.value = true
-    console.log('Saving todos to file:', selectedCalendar.value.path)
-    console.log('Todos to save:', todos.value.length, 'items')
-    
-    // Ensure todos have correct format for backend compatibility
-    const todosWithCalendarName = todos.value.map(todo => ({
-      ...todo,
-      id: todo.id.toString(), // Ensure ID is always a string
-      calendar_name: selectedCalendar.value.name,
-      // Ensure dates are strings
-      dueDate: todo.dueDate ? (typeof todo.dueDate === 'string' ? todo.dueDate : todo.dueDate.toISOString().split('T')[0]) : null,
-      createdAt: todo.createdAt ? (typeof todo.createdAt === 'string' ? todo.createdAt : todo.createdAt.toISOString()) : null
-    }))
-    
-    await invoke('save_todos_to_calendar', { 
-      calendarPath: selectedCalendar.value.path, 
-      todos: todosWithCalendarName 
-    })
-    console.log('Todos saved successfully to file')
-  } catch (error) {
-    console.error('Failed to save todos:', error)
-    alert('Failed to save changes. Please try again.')
-  } finally {
-    saving.value = false
-    // Force calendar recompute and sidebar refresh if open
-    calendarUpdateKey.value++
-    if (selectedDate.value) {
-      sidebarTasks.value = getTasksForDate(selectedDate.value)
+  // No longer need to check for date picker blocking - custom picker doesn't block
+  
+  // Clear any pending debounced save
+  if (saveDebounceTimer) {
+    clearTimeout(saveDebounceTimer)
+    saveDebounceTimer = null
+  }
+  
+  const performSave = async () => {
+    try {
+      saving.value = true
+      console.log('Saving todos to file:', selectedCalendar.value.path)
+      console.log('Todos to save:', todos.value.length, 'items')
+      
+      // Ensure todos have correct format for backend compatibility
+      const todosWithCalendarName = todos.value.map(todo => ({
+        ...todo,
+        id: todo.id.toString(), // Ensure ID is always a string
+        calendar_name: selectedCalendar.value.name,
+        // Ensure dates are strings
+        dueDate: todo.dueDate ? (typeof todo.dueDate === 'string' ? todo.dueDate : todo.dueDate.toISOString().split('T')[0]) : null,
+        createdAt: todo.createdAt ? (typeof todo.createdAt === 'string' ? todo.createdAt : todo.createdAt.toISOString()) : null
+      }))
+      
+      // Use setTimeout to yield to the event loop and prevent UI blocking
+      await new Promise(resolve => {
+        setTimeout(async () => {
+          try {
+            await invoke('save_todos_to_calendar', { 
+              calendarPath: selectedCalendar.value.path, 
+              todos: todosWithCalendarName 
+            })
+            console.log('Todos saved successfully to file')
+          } catch (error) {
+            console.error('Failed to save todos:', error)
+            alert('Failed to save changes. Please try again.')
+          }
+          resolve()
+        }, 0)
+      })
+    } finally {
+      saving.value = false
+      // Force calendar recompute and sidebar refresh if open
+      calendarUpdateKey.value++
+      if (selectedDate.value) {
+        sidebarTasks.value = getTasksForDate(selectedDate.value)
+      }
     }
+  }
+  
+  // If immediate, save right away, otherwise debounce
+  if (immediate) {
+    await performSave()
+  } else {
+    // Debounce saves by 500ms to avoid blocking UI during rapid changes
+    saveDebounceTimer = setTimeout(performSave, 500)
   }
 }
 
@@ -506,7 +726,8 @@ const createTask = async () => {
     // Close immediately for responsiveness
     closeTaskForm()
     await nextTick()
-    await saveTodosToFile()
+    // Immediate save when form is submitted
+    await saveTodosToFile(true)
   } finally {
     // Ensure state is reset even if an error occurred
     if (showTaskForm.value) closeTaskForm()
@@ -515,6 +736,9 @@ const createTask = async () => {
 }
 
 const closeTaskForm = () => {
+  // Close custom date picker if open
+  showDueDatePicker.value = false
+  
   showTaskForm.value = false
   isEditingTask.value = false
   editingTaskId.value = null
@@ -529,7 +753,6 @@ const closeTaskForm = () => {
   multiDates.value = []
   multiDateInput.value = ''
   multiDateError.value = ''
-  showDueDatePicker.value = false
 }
 
 const selectDate = (date) => {
@@ -684,24 +907,44 @@ const formatDateForSidebar = (date) => {
         </div>
 
         <!-- Calendar List -->
-        <div v-else-if="calendars.length === 0" class="text-center py-12">
+        <div v-else-if="allCalendars.length === 0" class="text-center py-12">
           <div class="text-slate-400 text-lg mb-4">No calendar files found</div>
-          <p class="text-slate-500 mb-6">Place .ics files in your calendars directory to get started</p>
+          <p class="text-slate-500 mb-6">Place .ics files in your calendars directory or browse for calendar files</p>
           <div class="text-sm text-slate-400 bg-slate-100 p-4 rounded-lg max-w-md mx-auto">
             <p class="font-medium mb-2">Calendar files should be placed in:</p>
             <code class="text-xs">{{ calendarsPath || 'calendars/' }}</code>
           </div>
-          <div class="mt-6">
+          <div class="mt-6 flex gap-3 justify-center">
             <button 
               @click="openNewCalendarModal"
               class="px-4 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors"
             >
               Create New Calendar
             </button>
+            <button 
+              @click="browseForCalendarFile"
+              class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+            >
+              Browse for Calendar File
+            </button>
           </div>
         </div>
         
-        <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div v-else class="space-y-6">
+          <!-- Action Buttons -->
+          <div class="flex gap-3 justify-end">
+            <button 
+              @click="browseForCalendarFile"
+              class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-2"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+              </svg>
+              Browse for Calendar File
+            </button>
+          </div>
+          
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <!-- New Calendar Card -->
           <div 
             @click="openNewCalendarModal"
@@ -718,12 +961,28 @@ const formatDateForSidebar = (date) => {
           </div>
 
           <div 
-            v-for="calendar in calendars" 
+            v-for="calendar in allCalendars" 
             :key="calendar.path"
-            @click="loadTodosFromCalendar(calendar)"
-            class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 hover:shadow-md transition-shadow cursor-pointer group"
+            class="bg-white rounded-lg shadow-sm border border-slate-200 p-6 hover:shadow-md transition-shadow group relative"
           >
-            <div class="flex items-start justify-between mb-4">
+            <!-- External calendar indicator and remove button -->
+            <div v-if="externalCalendars.some(ec => ec.path === calendar.path)" 
+                 class="absolute top-2 right-2 flex items-center gap-2">
+              <span class="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded-full">External</span>
+              <button 
+                @click.stop="removeExternalCalendar(calendar.path)"
+                class="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors"
+                title="Remove external calendar"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div 
+              @click="loadTodosFromCalendar(calendar)"
+              class="flex items-start justify-between mb-4 cursor-pointer"
+            >
               <h3 class="text-lg font-semibold text-slate-800 group-hover:text-emerald-600 transition-colors">
                 {{ calendar.name }}
               </h3>
@@ -747,6 +1006,7 @@ const formatDateForSidebar = (date) => {
                 Modified {{ formatLastModified(calendar.last_modified) }}
               </div>
             </div>
+          </div>
           </div>
         </div>
 
@@ -1353,8 +1613,12 @@ const formatDateForSidebar = (date) => {
       </button>
 
       <!-- Task Creation Modal -->
-      <div v-if="showTaskForm" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-        <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+      <div 
+        v-if="showTaskForm" 
+        class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50"
+        @click.self="closeTaskForm"
+      >
+        <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6" @click.stop>
           <!-- Inline multi-date calendar picker -->
           <div v-if="showDueDatePicker" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-[60]">
             <div class="bg-white rounded-lg shadow-xl w-full max-w-md">
@@ -1399,10 +1663,20 @@ const formatDateForSidebar = (date) => {
                   </button>
                 </div>
                 <div class="mt-4 flex items-center justify-between">
-                  <div class="text-xs text-slate-500">Selected: {{ multiDates.length }}</div>
+                  <div class="text-xs text-slate-500">
+                    <span v-if="isSingleDateMode">Select a date</span>
+                    <span v-else>Selected: {{ multiDates.length }}</span>
+                  </div>
                   <div class="flex gap-2">
                     <button type="button" @click="closeDueDatePicker" class="px-3 py-2 text-slate-700 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
-                    <button type="button" @click="applyDuePickerSelection" class="px-3 py-2 bg-emerald-500 text-white rounded-md hover:bg-emerald-600">Apply</button>
+                    <button 
+                      v-if="!isSingleDateMode" 
+                      type="button" 
+                      @click="applyDuePickerSelection" 
+                      class="px-3 py-2 bg-emerald-500 text-white rounded-md hover:bg-emerald-600"
+                    >
+                      Apply
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1472,16 +1746,27 @@ const formatDateForSidebar = (date) => {
               <label class="block text-sm font-medium text-slate-700 mb-1">Due Date</label>
               <div class="flex gap-2">
                 <input 
-                  v-model="newTask.dueDate"
-                  type="date"
-                  class="flex-1 px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                  :value="formatDateForDisplay(newTask.dueDate)"
+                  type="text"
+                  readonly
+                  @click="openDueDatePicker(true)"
+                  class="flex-1 px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 cursor-pointer bg-white"
+                  placeholder="Click to select date"
                 >
                 <button 
                   type="button"
-                  @click="openDueDatePicker"
+                  @click="openDueDatePicker(false)"
                   class="px-3 py-2 bg-slate-100 text-slate-700 rounded-md hover:bg-slate-200"
                 >Pick multiple</button>
               </div>
+              <button
+                v-if="newTask.dueDate"
+                type="button"
+                @click="newTask.dueDate = ''"
+                class="mt-1 text-xs text-slate-500 hover:text-slate-700"
+              >
+                Clear date
+              </button>
             </div>
 
             <!-- Selected multi-dates chips -->
