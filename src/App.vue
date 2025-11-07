@@ -37,6 +37,84 @@ const newTask = ref({
   dueDate: ''
 })
 
+// Multi-date creation state
+const multiDateMode = ref(false)
+const multiDates = ref([])
+const multiDateInput = ref('')
+const multiDateError = ref('')
+
+// In-modal multi-date picker state
+const showDueDatePicker = ref(false)
+const duePickerCurrent = ref(new Date())
+const duePickerMonthYear = computed(() => {
+  return duePickerCurrent.value.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+})
+const duePickerDays = computed(() => {
+  const year = duePickerCurrent.value.getFullYear()
+  const month = duePickerCurrent.value.getMonth()
+  const firstDay = new Date(year, month, 1)
+  const startDate = new Date(firstDay)
+  startDate.setDate(startDate.getDate() - firstDay.getDay())
+  const days = []
+  const cursor = new Date(startDate)
+  for (let i = 0; i < 42; i++) {
+    days.push({ date: new Date(cursor), isCurrentMonth: cursor.getMonth() === month })
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return days
+})
+
+const togglePickerDate = (d) => {
+  const ymd = formatDateForInput(d)
+  if (!ymd) return
+  if (multiDates.value.includes(ymd)) {
+    multiDates.value = multiDates.value.filter(x => x !== ymd)
+  } else {
+    multiDates.value = Array.from(new Set([...multiDates.value, ymd]))
+  }
+}
+
+const isPickerSelected = (d) => {
+  const ymd = formatDateForInput(d)
+  return !!ymd && multiDates.value.includes(ymd)
+}
+
+const openDueDatePicker = () => {
+  multiDateError.value = ''
+  showDueDatePicker.value = true
+  // Initialize picker month around the first selected date or today
+  const base = multiDates.value[0] ? createLocalDate(multiDates.value[0]) : new Date()
+  duePickerCurrent.value = base || new Date()
+}
+
+const closeDueDatePicker = () => {
+  showDueDatePicker.value = false
+}
+
+const prevDuePickerMonth = () => {
+  const d = duePickerCurrent.value
+  duePickerCurrent.value = new Date(d.getFullYear(), d.getMonth() - 1, 1)
+}
+
+const nextDuePickerMonth = () => {
+  const d = duePickerCurrent.value
+  duePickerCurrent.value = new Date(d.getFullYear(), d.getMonth() + 1, 1)
+}
+
+const applyDuePickerSelection = () => {
+  // If exactly one date selected, mirror it into the single-date field for convenience
+  if (multiDates.value.length === 1) {
+    newTask.value.dueDate = multiDates.value[0]
+  }
+  showDueDatePicker.value = false
+}
+
+// New calendar modal state
+const showNewCalendarModal = ref(false)
+const newCalendarName = ref('')
+const creatingCalendar = ref(false)
+const newCalendarError = ref('')
+
 // Load calendars on startup
 onMounted(async () => {
   await loadCalendars()
@@ -98,6 +176,37 @@ const loadCalendarsPath = async () => {
     console.error('Failed to load calendars path:', error)
     // Show the actual error instead of a fallback
     calendarsPath.value = `Error: ${error}`
+  }
+}
+
+// New calendar actions
+const openNewCalendarModal = () => {
+  showNewCalendarModal.value = true
+  newCalendarName.value = ''
+  newCalendarError.value = ''
+}
+
+const closeNewCalendarModal = () => {
+  showNewCalendarModal.value = false
+  newCalendarName.value = ''
+  newCalendarError.value = ''
+}
+
+const createNewCalendar = async () => {
+  if (!newCalendarName.value.trim()) {
+    newCalendarError.value = 'Please enter a calendar name'
+    return
+  }
+  try {
+    creatingCalendar.value = true
+    await invoke('create_calendar', { name: newCalendarName.value.trim() })
+    await loadCalendars()
+    closeNewCalendarModal()
+  } catch (error) {
+    console.error('Failed to create calendar:', error)
+    newCalendarError.value = String(error)
+  } finally {
+    creatingCalendar.value = false
   }
 }
 
@@ -185,6 +294,32 @@ const completedTodos = computed(() => {
   const completed = filteredTodos.value.filter(todo => todo.completed)
   return sortTodosByOrder(completed, completedSortOrder.value)
 })
+
+// Group tasks by due date while preserving the existing sort order
+const groupTodosByDueDate = (items) => {
+  const groups = []
+  const groupMap = new Map()
+  for (const todo of items) {
+    const key = todo.dueDate ? formatDateForInput(todo.dueDate) : 'no-date'
+    if (!groupMap.has(key)) {
+      const group = { key, label: formatDateHeaderLabel(key), items: [] }
+      groupMap.set(key, group)
+      groups.push(group)
+    }
+    groupMap.get(key).items.push(todo)
+  }
+  return groups
+}
+
+const formatDateHeaderLabel = (key) => {
+  if (!key || key === 'no-date') return 'No Due Date'
+  const d = toDate(key)
+  if (!d) return 'No Due Date'
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+const groupedIncompleteTodos = computed(() => groupTodosByDueDate(incompleteTodos.value))
+const groupedCompletedTodos = computed(() => groupTodosByDueDate(completedTodos.value))
 
 const currentMonthYear = computed(() => {
   return currentDate.value.toLocaleDateString('en-US', { 
@@ -330,19 +465,40 @@ const createTask = async () => {
       console.error('Task not found for ID:', editingTaskId.value)
     }
   } else {
-    // Create new task
-    const task = {
-      id: Date.now().toString(),
-      title: newTask.value.title,
-      description: newTask.value.description,
-      completed: false,
-      priority: newTask.value.priority,
-      category: newTask.value.category || null,
-      dueDate: newTask.value.dueDate ? createLocalDate(newTask.value.dueDate) : null,
-      createdAt: new Date()
+    // Create new task(s)
+    const baseCreatedAt = new Date()
+    const baseId = Date.now()
+
+    // Use multi-date picker selection if provided
+    const selectedDates = Array.from(new Set((multiDates.value || []).filter(Boolean)))
+
+    if (selectedDates.length > 0) {
+      selectedDates.forEach((dateStr, index) => {
+        const task = {
+          id: `${baseId}-${index}`,
+          title: newTask.value.title,
+          description: newTask.value.description,
+          completed: false,
+          priority: newTask.value.priority,
+          category: newTask.value.category || null,
+          dueDate: createLocalDate(dateStr),
+          createdAt: baseCreatedAt
+        }
+        todos.value.push(task)
+      })
+    } else {
+      const task = {
+        id: baseId.toString(),
+        title: newTask.value.title,
+        description: newTask.value.description,
+        completed: false,
+        priority: newTask.value.priority,
+        category: newTask.value.category || null,
+        dueDate: newTask.value.dueDate ? createLocalDate(newTask.value.dueDate) : null,
+        createdAt: baseCreatedAt
+      }
+      todos.value.push(task)
     }
-    
-    todos.value.push(task)
   }
   
   // Save changes to file and ensure modal is closed regardless of outcome
@@ -369,6 +525,11 @@ const closeTaskForm = () => {
     category: '',
     dueDate: ''
   }
+  // Reset multi-date state
+  multiDates.value = []
+  multiDateInput.value = ''
+  multiDateError.value = ''
+  showDueDatePicker.value = false
 }
 
 const selectDate = (date) => {
@@ -530,9 +691,32 @@ const formatDateForSidebar = (date) => {
             <p class="font-medium mb-2">Calendar files should be placed in:</p>
             <code class="text-xs">{{ calendarsPath || 'calendars/' }}</code>
           </div>
+          <div class="mt-6">
+            <button 
+              @click="openNewCalendarModal"
+              class="px-4 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors"
+            >
+              Create New Calendar
+            </button>
+          </div>
         </div>
         
         <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <!-- New Calendar Card -->
+          <div 
+            @click="openNewCalendarModal"
+            class="bg-white rounded-lg shadow-sm border border-dashed border-emerald-300 p-6 hover:shadow-md transition-shadow cursor-pointer group flex items-center justify-center"
+          >
+            <div class="text-center">
+              <div class="mx-auto mb-3 w-10 h-10 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center group-hover:bg-emerald-100">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                </svg>
+              </div>
+              <div class="text-emerald-700 font-medium">Create New Calendar</div>
+            </div>
+          </div>
+
           <div 
             v-for="calendar in calendars" 
             :key="calendar.path"
@@ -561,6 +745,58 @@ const formatDateForSidebar = (date) => {
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 Modified {{ formatLastModified(calendar.last_modified) }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- New Calendar Modal -->
+        <div v-if="showNewCalendarModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-lg font-semibold text-slate-800">Create New Calendar</h3>
+              <button @click="closeNewCalendarModal" class="text-slate-400 hover:text-slate-600">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="space-y-4">
+              <div>
+                <label class="block text-sm font-medium text-slate-700 mb-1">Calendar Name</label>
+                <input 
+                  v-model="newCalendarName"
+                  type="text" 
+                  class="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                  placeholder="e.g., Work, Personal, Shopping"
+                  @keydown.enter.prevent="createNewCalendar"
+                >
+              </div>
+
+              <p v-if="newCalendarError" class="text-sm text-red-600">{{ newCalendarError }}</p>
+
+              <div class="flex space-x-3 pt-2">
+                <button 
+                  type="button"
+                  @click="closeNewCalendarModal"
+                  class="flex-1 px-4 py-2 border border-slate-300 text-slate-700 rounded-md hover:bg-slate-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="button"
+                  @click="createNewCalendar"
+                  :disabled="creatingCalendar"
+                  :class="[
+                    'flex-1 px-4 py-2 rounded-md transition-colors',
+                    creatingCalendar
+                      ? 'bg-emerald-300 text-white cursor-not-allowed'
+                      : 'bg-emerald-500 text-white hover:bg-emerald-600'
+                  ]"
+                >
+                  {{ creatingCalendar ? 'Creating...' : 'Create' }}
+                </button>
               </div>
             </div>
           </div>
@@ -686,8 +922,8 @@ const formatDateForSidebar = (date) => {
           </button>
         </div>
         
-        <!-- Incomplete Tasks -->
-        <div v-if="incompleteTodos.length > 0" class="space-y-3">
+        <!-- Incomplete Tasks grouped by due date -->
+        <div v-if="incompleteTodos.length > 0" class="space-y-6">
           <div class="flex items-center justify-between">
             <h3 class="text-sm font-medium text-slate-600 uppercase tracking-wide">Incomplete Tasks</h3>
             <button 
@@ -701,87 +937,96 @@ const formatDateForSidebar = (date) => {
               <span>{{ incompleteSortOrder === 'asc' ? 'Oldest First' : 'Newest First' }}</span>
             </button>
           </div>
-          <div v-for="todo in incompleteTodos" :key="todo.id" 
-               class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 hover:shadow-md transition-shadow">
-            <div class="flex items-start justify-between">
-            <div class="flex items-start space-x-3 flex-1">
-              <button 
-                @click="toggleTodo(todo.id)"
-                :class="[
-                  'mt-1 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors',
-                  todo.completed 
-                    ? 'bg-emerald-500 border-emerald-500 text-white' 
-                    : 'border-slate-300 hover:border-emerald-400'
-                ]"
-              >
-                <svg v-if="todo.completed" class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
-                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
-                </svg>
-              </button>
-              
-              <div class="flex-1">
-                <h3 :class="[
-                  'font-medium text-slate-800',
-                  todo.completed && 'line-through text-slate-500'
-                ]">
-                  {{ todo.title }}
-                </h3>
-                <p v-if="todo.description" :class="[
-                  'text-sm text-slate-600 mt-1 whitespace-pre-line',
-                  todo.completed && 'line-through text-slate-400'
-                ]">
-                  {{ todo.description }}
-                </p>
+          <div v-for="group in groupedIncompleteTodos" :key="group.key" class="space-y-3">
+            <div class="sticky top-0 bg-slate-50 z-10">
+              <div class="flex items-center gap-2 py-2">
+                <div class="w-1 h-5 bg-emerald-400 rounded"></div>
+                <div class="text-xs font-semibold text-slate-600">{{ group.label }}</div>
+                <div class="text-[10px] text-slate-400">• {{ group.items.length }}</div>
+              </div>
+            </div>
+            <div v-for="todo in group.items" :key="todo.id" 
+                 class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 hover:shadow-md transition-shadow">
+              <div class="flex items-start justify-between">
+                <div class="flex items-start space-x-3 flex-1">
+                  <button 
+                    @click="toggleTodo(todo.id)"
+                    :class="[
+                      'mt-1 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors',
+                      todo.completed 
+                        ? 'bg-emerald-500 border-emerald-500 text-white' 
+                        : 'border-slate-300 hover:border-emerald-400'
+                    ]"
+                  >
+                    <svg v-if="todo.completed" class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                      <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                    </svg>
+                  </button>
+                  
+                  <div class="flex-1">
+                    <h3 :class="[
+                      'font-medium text-slate-800',
+                      todo.completed && 'line-through text-slate-500'
+                    ]">
+                      {{ todo.title }}
+                    </h3>
+                    <p v-if="todo.description" :class="[
+                      'text-sm text-slate-600 mt-1 whitespace-pre-line',
+                      todo.completed && 'line-through text-slate-400'
+                    ]">
+                      {{ todo.description }}
+                    </p>
+                    
+                    <div class="flex items-center space-x-4 mt-2">
+                      <span :class="[
+                        'px-2 py-1 rounded-full text-xs font-medium',
+                        getPriorityColor(todo.priority)
+                      ]">
+                        {{ todo.priority }}
+                      </span>
+                      
+                      <span v-if="todo.category" class="px-2 py-1 bg-slate-100 text-slate-700 rounded-full text-xs">
+                        {{ todo.category }}
+                      </span>
+                      
+                      <span class="text-xs text-slate-500">
+                        {{ todo.createdAt ? `Created: ${formatDate(todo.createdAt)}` : 'No date' }}
+                      </span>
+                      
+                      <span v-if="todo.dueDate" class="text-xs text-slate-500">
+                        Due: {{ formatDate(todo.dueDate) }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
                 
-                <div class="flex items-center space-x-4 mt-2">
-                  <span :class="[
-                    'px-2 py-1 rounded-full text-xs font-medium',
-                    getPriorityColor(todo.priority)
-                  ]">
-                    {{ todo.priority }}
-                  </span>
-                  
-                  <span v-if="todo.category" class="px-2 py-1 bg-slate-100 text-slate-700 rounded-full text-xs">
-                    {{ todo.category }}
-                  </span>
-                  
-                  <span class="text-xs text-slate-500">
-                    {{ todo.createdAt ? `Created: ${formatDate(todo.createdAt)}` : 'No date' }}
-                  </span>
-                  
-                  <span v-if="todo.dueDate" class="text-xs text-slate-500">
-                    Due: {{ formatDate(todo.dueDate) }}
-                  </span>
+                <div class="flex items-center space-x-1">
+                  <button 
+                    @click="editTodo(todo.id)"
+                    class="text-slate-400 hover:text-blue-500 transition-colors p-1"
+                    title="Edit task"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                    </svg>
+                  </button>
+                  <button 
+                    @click="deleteTodo(todo.id)"
+                    class="text-slate-400 hover:text-red-500 transition-colors p-1"
+                    title="Delete task"
+                  >
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                  </button>
                 </div>
               </div>
             </div>
-            
-            <div class="flex items-center space-x-1">
-              <button 
-                @click="editTodo(todo.id)"
-                class="text-slate-400 hover:text-blue-500 transition-colors p-1"
-                title="Edit task"
-              >
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                </svg>
-              </button>
-              <button 
-                @click="deleteTodo(todo.id)"
-                class="text-slate-400 hover:text-red-500 transition-colors p-1"
-                title="Delete task"
-              >
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-              </button>
-            </div>
           </div>
         </div>
-        </div>
         
-        <!-- Completed Tasks -->
-        <div v-if="showCompletedInList && completedTodos.length > 0" class="space-y-3">
+        <!-- Completed Tasks grouped by due date -->
+        <div v-if="showCompletedInList && completedTodos.length > 0" class="space-y-6">
           <div class="flex items-center justify-between">
             <h3 class="text-sm font-medium text-slate-600 uppercase tracking-wide">Completed Tasks</h3>
             <button 
@@ -795,8 +1040,16 @@ const formatDateForSidebar = (date) => {
               <span>{{ completedSortOrder === 'asc' ? 'Oldest First' : 'Newest First' }}</span>
             </button>
           </div>
-          <div v-for="todo in completedTodos" :key="todo.id" 
-               class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 hover:shadow-md transition-shadow opacity-75">
+          <div v-for="group in groupedCompletedTodos" :key="group.key" class="space-y-3">
+            <div class="sticky top-0 bg-slate-50 z-10">
+              <div class="flex items-center gap-2 py-2">
+                <div class="w-1 h-5 bg-slate-400 rounded"></div>
+                <div class="text-xs font-semibold text-slate-600">{{ group.label }}</div>
+                <div class="text-[10px] text-slate-400">• {{ group.items.length }}</div>
+              </div>
+            </div>
+            <div v-for="todo in group.items" :key="todo.id" 
+                 class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 hover:shadow-md transition-shadow opacity-75">
             <div class="flex items-start justify-between">
               <div class="flex items-start space-x-3 flex-1">
                 <button 
@@ -846,8 +1099,9 @@ const formatDateForSidebar = (date) => {
                     <span v-if="todo.dueDate" class="text-xs text-slate-500">
                       Due: {{ formatDate(todo.dueDate) }}
                     </span>
-                  </div>
-                </div>
+              </div>
+            </div>
+          </div>
               </div>
               
               <div class="flex items-center space-x-1">
@@ -1101,6 +1355,59 @@ const formatDateForSidebar = (date) => {
       <!-- Task Creation Modal -->
       <div v-if="showTaskForm" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
         <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+          <!-- Inline multi-date calendar picker -->
+          <div v-if="showDueDatePicker" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-[60]">
+            <div class="bg-white rounded-lg shadow-xl w-full max-w-md">
+              <div class="flex items-center justify-between px-4 py-3 border-b">
+                <button @click="prevDuePickerMonth" class="p-2 hover:bg-slate-100 rounded">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                  </svg>
+                </button>
+                <div class="text-sm font-medium text-slate-700">{{ duePickerMonthYear }}</div>
+                <button @click="nextDuePickerMonth" class="p-2 hover:bg-slate-100 rounded">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </div>
+              <div class="p-4">
+                <div class="grid grid-cols-7 gap-1 text-xs text-slate-500 mb-2">
+                  <div class="text-center">Sun</div>
+                  <div class="text-center">Mon</div>
+                  <div class="text-center">Tue</div>
+                  <div class="text-center">Wed</div>
+                  <div class="text-center">Thu</div>
+                  <div class="text-center">Fri</div>
+                  <div class="text-center">Sat</div>
+                </div>
+                <div class="grid grid-cols-7 gap-1">
+                  <button 
+                    v-for="d in duePickerDays" :key="`${d.date}-${d.isCurrentMonth}`"
+                    type="button"
+                    @click="togglePickerDate(d.date)"
+                    :class="[
+                      'relative p-2 text-sm rounded border transition-colors',
+                      d.isCurrentMonth ? 'bg-white border-slate-200' : 'bg-slate-50 border-slate-100 text-slate-400',
+                      isPickerSelected(d.date) && 'bg-white border-emerald-500 text-slate-800 font-semibold ring-2 ring-emerald-300'
+                    ]"
+                  >
+                    <span>{{ d.date.getDate() }}</span>
+                    <svg v-if="isPickerSelected(d.date)" class="w-3 h-3 absolute top-1 right-1 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
+                    </svg>
+                  </button>
+                </div>
+                <div class="mt-4 flex items-center justify-between">
+                  <div class="text-xs text-slate-500">Selected: {{ multiDates.length }}</div>
+                  <div class="flex gap-2">
+                    <button type="button" @click="closeDueDatePicker" class="px-3 py-2 text-slate-700 border border-slate-300 rounded-md hover:bg-slate-50">Cancel</button>
+                    <button type="button" @click="applyDuePickerSelection" class="px-3 py-2 bg-emerald-500 text-white rounded-md hover:bg-emerald-600">Apply</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="flex items-center justify-between mb-4">
             <h3 class="text-lg font-semibold text-slate-800">
               {{ isEditingTask ? 'Edit Task' : 'Create New Task' }}
@@ -1163,11 +1470,34 @@ const formatDateForSidebar = (date) => {
 
             <div>
               <label class="block text-sm font-medium text-slate-700 mb-1">Due Date</label>
-              <input 
-                v-model="newTask.dueDate"
-                type="date"
-                class="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-              >
+              <div class="flex gap-2">
+                <input 
+                  v-model="newTask.dueDate"
+                  type="date"
+                  class="flex-1 px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                >
+                <button 
+                  type="button"
+                  @click="openDueDatePicker"
+                  class="px-3 py-2 bg-slate-100 text-slate-700 rounded-md hover:bg-slate-200"
+                >Pick multiple</button>
+              </div>
+            </div>
+
+            <!-- Selected multi-dates chips -->
+            <div v-if="multiDates.length" class="pt-2">
+              <div class="text-xs text-slate-500 mb-2">Selected dates</div>
+              <div class="flex flex-wrap gap-2">
+                <span 
+                  v-for="d in multiDates" :key="d"
+                  class="inline-flex items-center gap-2 px-2 py-1 text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full"
+                >
+                  {{ d }}
+                  <button type="button" class="text-emerald-700/70 hover:text-emerald-900"
+                    @click="() => { multiDates = multiDates.filter(x => x !== d) }"
+                  >×</button>
+                </span>
+              </div>
             </div>
 
             <div class="flex space-x-3 pt-4">

@@ -125,6 +125,96 @@ fn has_ics_files(dir: &PathBuf) -> bool {
     false
 }
 
+// Sanitize a user-provided calendar name into a safe filename (without extension)
+fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let fallback = if trimmed.is_empty() { "untitled" } else { trimmed };
+    let mut result = String::with_capacity(fallback.len());
+    for ch in fallback.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => result.push(ch),
+            ' ' | '-' | '_' => result.push('-'),
+            _ => result.push('-'),
+        }
+    }
+    // Collapse consecutive dashes
+    let mut collapsed = String::with_capacity(result.len());
+    let mut prev_dash = false;
+    for c in result.chars() {
+        if c == '-' {
+            if !prev_dash {
+                collapsed.push('-');
+                prev_dash = true;
+            }
+        } else {
+            collapsed.push(c);
+            prev_dash = false;
+        }
+    }
+    let collapsed = collapsed.trim_matches('-');
+    if collapsed.is_empty() { "untitled".to_string() } else { collapsed.to_string() }
+}
+
+// Create a new empty iCalendar file and return its descriptor
+#[tauri::command]
+async fn create_calendar(name: String) -> Result<CalendarFile, String> {
+    let calendars_dir = get_calendars_dir()?;
+
+    let mut base = sanitize_filename(&name);
+    if base.is_empty() {
+        base = "untitled".to_string();
+    }
+
+    // Ensure unique filename by appending numeric suffix if needed
+    let mut candidate = calendars_dir.join(format!("{}.ics", base));
+    if candidate.exists() {
+        let mut idx: u32 = 1;
+        loop {
+            let alt = calendars_dir.join(format!("{}-{}.ics", base, idx));
+            if !alt.exists() {
+                candidate = alt;
+                break;
+            }
+            idx += 1;
+            if idx > 1000 {
+                return Err("Failed to create unique calendar filename".to_string());
+            }
+        }
+    }
+
+    // Minimal VCALENDAR skeleton
+    let mut content = String::new();
+    content.push_str("BEGIN:VCALENDAR\r\n");
+    content.push_str("VERSION:2.0\r\n");
+    content.push_str("PRODID:-//Todo Calendar//Todo Calendar//EN\r\n");
+    content.push_str("CALSCALE:GREGORIAN\r\n");
+    content.push_str("END:VCALENDAR\r\n");
+
+    fs::write(&candidate, content)
+        .map_err(|e| format!("Failed to create calendar file: {}", e))?;
+
+    let metadata = fs::metadata(&candidate)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+
+    let last_modified = metadata.modified()
+        .map_err(|e| format!("Failed to get modification time: {}", e))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to convert modification time: {}", e))?
+        .as_secs();
+
+    let name = candidate.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    Ok(CalendarFile {
+        name,
+        path: candidate.to_string_lossy().to_string(),
+        last_modified: last_modified.to_string(),
+        todo_count: 0,
+    })
+}
+
 // List all available calendar files
 #[tauri::command]
 async fn list_calendars() -> Result<Vec<CalendarFile>, String> {
@@ -524,7 +614,7 @@ fn unescape_ical_text(text: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, get_calendars_path, list_calendars, load_todos_from_calendar, save_todos_to_calendar])
+        .invoke_handler(tauri::generate_handler![greet, get_calendars_path, list_calendars, load_todos_from_calendar, save_todos_to_calendar, create_calendar])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
