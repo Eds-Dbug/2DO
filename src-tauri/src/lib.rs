@@ -215,6 +215,36 @@ async fn create_calendar(name: String) -> Result<CalendarFile, String> {
     })
 }
 
+// Helper function to add a calendar file to the list
+fn add_calendar_file(calendars: &mut Vec<CalendarFile>, path: &PathBuf) -> Result<(), String> {
+    if path.extension().and_then(|s| s.to_str()) == Some("ics") {
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+        
+        let name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        
+        let last_modified = metadata.modified()
+            .map_err(|e| format!("Failed to get modification time: {}", e))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Failed to convert modification time: {}", e))?
+            .as_secs();
+        
+        // Count todos in this calendar
+        let todo_count = count_todos_in_file(path).unwrap_or(0);
+        
+        calendars.push(CalendarFile {
+            name,
+            path: path.to_string_lossy().to_string(),
+            last_modified: last_modified.to_string(),
+            todo_count,
+        });
+    }
+    Ok(())
+}
+
 // List all available calendar files
 #[tauri::command]
 async fn list_calendars() -> Result<Vec<CalendarFile>, String> {
@@ -227,38 +257,50 @@ async fn list_calendars() -> Result<Vec<CalendarFile>, String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
         let path = entry.path();
-        
-        if path.extension().and_then(|s| s.to_str()) == Some("ics") {
-            let metadata = entry.metadata()
-                .map_err(|e| format!("Failed to read file metadata: {}", e))?;
-            
-            let name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            
-            let last_modified = metadata.modified()
-                .map_err(|e| format!("Failed to get modification time: {}", e))?
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("Failed to convert modification time: {}", e))?
-                .as_secs();
-            
-            // Count todos in this calendar
-            let todo_count = count_todos_in_file(&path).unwrap_or(0);
-            
-            calendars.push(CalendarFile {
-                name,
-                path: path.to_string_lossy().to_string(),
-                last_modified: last_modified.to_string(),
-                todo_count,
-            });
-        }
+        add_calendar_file(&mut calendars, &path)?;
     }
     
     // Sort by last modified (newest first)
     calendars.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     
     Ok(calendars)
+}
+
+// Add a calendar file from an external path
+#[tauri::command]
+async fn add_external_calendar(calendar_path: String) -> Result<CalendarFile, String> {
+    let path = PathBuf::from(&calendar_path);
+    
+    if !path.exists() {
+        return Err("File does not exist".to_string());
+    }
+    
+    if path.extension().and_then(|s| s.to_str()) != Some("ics") {
+        return Err("File must have .ics extension".to_string());
+    }
+    
+    let metadata = fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    
+    let name = path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    
+    let last_modified = metadata.modified()
+        .map_err(|e| format!("Failed to get modification time: {}", e))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to convert modification time: {}", e))?
+        .as_secs();
+    
+    let todo_count = count_todos_in_file(&path).unwrap_or(0);
+    
+    Ok(CalendarFile {
+        name,
+        path: path.to_string_lossy().to_string(),
+        last_modified: last_modified.to_string(),
+        todo_count,
+    })
 }
 
 // Count todos in a calendar file
@@ -614,7 +656,8 @@ fn unescape_ical_text(text: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, get_calendars_path, list_calendars, load_todos_from_calendar, save_todos_to_calendar, create_calendar])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![greet, get_calendars_path, list_calendars, load_todos_from_calendar, save_todos_to_calendar, create_calendar, add_external_calendar])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
